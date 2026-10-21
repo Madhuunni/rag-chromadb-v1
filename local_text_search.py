@@ -1,201 +1,158 @@
+
 import argparse
+import hashlib
 import json
 import uuid
 from pathlib import Path
 
 import chromadb
+from chromadb.config import Settings
+from filelock import FileLock
 import joblib
 import numpy as np
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sklearn.feature_extraction.text import TfidfVectorizer
-import re
-
-TOKEN_PATTERN = re.compile(r"\w+", flags=re.UNICODE)
+from text_processing import chunks, normalize, tokenize
 
 
-def tokenize(text):
-    return TOKEN_PATTERN.findall(text.lower())
-
-def create_chunks(text):
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,       # Characters, not tokens.
-        chunk_overlap=150,     # Target overlap.
-        separators=["\n\n", "\n", " ", ""],
-        length_function=len,
-    )
-
-    return [
-        chunk.strip()
-        for chunk in splitter.split_text(text)
-        if tokenize(chunk)
-    ]
+def client(root):
+    return chromadb.PersistentClient(path=str(root / 'chroma'),
+                                    settings=Settings(anonymized_telemetry=False))
 
 
-def get_client(index_dir):
-    return chromadb.PersistentClient(
-        path=str(index_dir / "chroma")
-    )
-
-
-def upload_or_update(filename, index_dir):
-    index_dir.mkdir(parents=True, exist_ok=True)
-
+def upload(filename, root, synonyms=None, size=700, overlap=100):
+    root = Path(root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
     source = Path(filename).resolve()
-    text = source.read_text(encoding="utf-8")
-    chunks = create_chunks(text)
-
-    if not chunks:
-        raise ValueError("The file has no indexable text.")
-
-    # Fit only on this document's chunks.
-    vectorizer = TfidfVectorizer(
-        tokenizer=tokenize,
-        token_pattern=None,
-        lowercase=False,       # tokenize() already lowercases.
-        ngram_range=(1, 2),     # Individual words and word pairs.
-        max_features=4096,
-        norm="l2",
-        dtype=np.float32,
-    )
-
-    matrix = vectorizer.fit_transform(chunks)
-
-    # Chroma's dense-vector index should not receive zero vectors.
-    valid_rows = np.flatnonzero(
-        np.asarray(matrix.getnnz(axis=1)).ravel() > 0
-    )
-    if not len(valid_rows):
-        raise ValueError("No non-zero document vectors were produced.")
-
-    client = get_client(index_dir)
-
-    # Build a fresh version before switching the active index.
-    version = uuid.uuid4().hex
-    collection_name = f"txt_{version}"
-    model_filename = f"vectorizer_{version}.joblib"
-
-    collection = client.create_collection(
-        name=collection_name,
-        embedding_function=None,  # Disable pretrained embeddings.
-        configuration={"hnsw": {"space": "cosine"}},
-    )
-
-    for start in range(0, len(valid_rows), 100):
-        rows = valid_rows[start:start + 100]
-
-        collection.add(
-            ids=[f"chunk_{int(i)}" for i in rows],
-            documents=[chunks[int(i)] for i in rows],
-            embeddings=matrix[rows].toarray().tolist(),
-            metadatas=[
-                {
-                    "source": str(source),
-                    "chunk_index": int(i),
-                }
-                for i in rows
-            ],
-        )
-
-    # Save the exact vectorizer used for this collection.
-    joblib.dump(vectorizer, index_dir / model_filename)
-
-    manifest_path = index_dir / "active.json"
-    previous = (
-        json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest_path.exists()
-        else None
-    )
-
-    manifest = {
-        "collection": collection_name,
-        "vectorizer": model_filename,
-        "source": str(source),
-    }
-
-    temporary = index_dir / "active.tmp"
-    temporary.write_text(json.dumps(manifest), encoding="utf-8")
-    temporary.replace(manifest_path)
-
-    # Clean up the prior version after the new one becomes active.
-    if previous:
-        client.delete_collection(previous["collection"])
-        (index_dir / previous["vectorizer"]).unlink(missing_ok=True)
-
-    print(f"Indexed file: {source.name}")
-    print(f"Stored chunks: {len(valid_rows)}")
-    print(f"Vector dimensions: {matrix.shape[1]}")
-
-
-def search(question, index_dir, top_k=3):
-    manifest_path = index_dir / "active.json"
-    if not manifest_path.exists():
-        raise ValueError("Upload a file before searching.")
-
-    manifest = json.loads(
-        manifest_path.read_text(encoding="utf-8")
-    )
-
-    # Load only the local artifact created by this application.
-    vectorizer = joblib.load(
-        index_dir / manifest["vectorizer"]
-    )
-
-    # Use transform(), never fit_transform(), for a question.
-    query_vector = vectorizer.transform([question])
-
-    if query_vector.nnz == 0:
-        print("No query words match the indexed vocabulary.")
-        return
-
-    collection = get_client(index_dir).get_collection(
-        name=manifest["collection"],
-        embedding_function=None,
-    )
-
-    results = collection.query(
-        query_embeddings=query_vector.toarray().tolist(),
-        n_results=min(top_k, collection.count()),
-        include=["documents", "metadatas", "distances"],
-    )
-
-    found = False
-
-    for document, metadata, distance in zip(
-        results["documents"][0],
-        results["metadatas"][0],
-        results["distances"][0],
+    if source.suffix.lower() != '.txt':
+        raise ValueError('Expected a .txt file')
+    if source.stat().st_size > 10 * 1024 * 1024:
+        raise ValueError('Demo limit: 10 MiB per text file')
+    text = source.read_text(encoding='utf-8-sig')
+    records = chunks(text, size, overlap)
+    if not records:
+        raise ValueError('No indexable paragraphs; use punctuation or # headings')
+    synonyms = synonyms or {}
+    if not isinstance(synonyms, dict) or any(
+        not isinstance(k, str) or not k.strip() or not isinstance(v, str)
+        or not v.strip() for k, v in synonyms.items()
     ):
-        similarity = 1.0 - distance
+        raise ValueError('Synonyms must map nonempty phrases to nonempty strings')
+    documents = [normalize(r['section'] + '\n' + r['text'], synonyms)
+                 for r in records]
+    vectorizer = TfidfVectorizer(tokenizer=tokenize, token_pattern=None,
+        lowercase=False, ngram_range=(1, 2), sublinear_tf=True,
+        norm='l2', dtype=np.float32)
+    matrix = vectorizer.fit_transform(documents)
+    if matrix.shape[1] > 20000:
+        raise ValueError('Vocabulary exceeds dense Chroma demo limit (20000); use sparse retrieval')
+    if np.any(np.asarray(matrix.getnnz(axis=1)).ravel() == 0):
+        raise ValueError('A chunk has no indexable words; revise the document')
+    with FileLock(str(root / 'index.lock'), timeout=120):
+        db = client(root)
+        version = uuid.uuid4().hex
+        name = 'txt_' + version
+        artifact = root / f'{version}.joblib'
+        manifest_path = root / 'active.json'
+        old = json.loads(manifest_path.read_text()) if manifest_path.exists() else None
+        collection = db.create_collection(name=name, embedding_function=None,
+                        configuration={'hnsw': {'space': 'cosine'}})
+        active = False
+        try:
+            for start in range(0, len(records), 64):
+                batch = records[start:start+64]
+                collection.add(
+                    ids=[str(i) for i in range(start, start+len(batch))],
+                    documents=[r['text'] for r in batch],
+                    embeddings=matrix[start:start+64].toarray().tolist(),
+                    metadatas=[{'source': str(source), 'section': r['section'],
+                                'chunk_index': r['chunk_index']} for r in batch])
+            # Keep sparse matrix for exact scoring: avoid ANN variability.
+            joblib.dump({'vectorizer': vectorizer, 'matrix': matrix,
+                         'records': records, 'synonyms': synonyms}, artifact)
+            manifest = {'collection': name, 'artifact': artifact.name,
+                        'source': str(source),
+                        'sha256': hashlib.sha256(text.encode()).hexdigest()}
+            temp = root / f'active_{version}.tmp'
+            temp.write_text(json.dumps(manifest), encoding='utf-8')
+            temp.replace(manifest_path)
+            active = True
+        finally:
+            if not active:
+                db.delete_collection(name)
+                artifact.unlink(missing_ok=True)
+        # Retain previous versions: avoids destroying rollback evidence.
+        if old:
+            (root / 'previous.json').write_text(json.dumps(old), encoding='utf-8')
+    return {'chunks': len(records), 'dimensions': matrix.shape[1], 'collection': name}
 
-        # Skip results with effectively no lexical overlap.
-        if similarity <= 1e-6:
-            continue
 
-        found = True
-        print(f"\nSimilarity: {similarity:.4f}")
-        print(f"Chunk: {metadata['chunk_index']}")
-        print(document)
+def search(question, root, top_k=3, min_score=0.15, min_coverage=0.5):
+    if not question.strip() or top_k < 1:
+        raise ValueError('Provide a question and positive top_k')
+    if not 0 <= min_score <= 1 or not 0 <= min_coverage <= 1:
+        raise ValueError('Score and coverage thresholds must be between 0 and 1')
+    root = Path(root).resolve()
+    if not (root / 'active.json').exists():
+        raise ValueError('Upload a file first')
+    with FileLock(str(root / 'index.lock'), timeout=120):
+        manifest = json.loads((root / 'active.json').read_text())
+        # Only load trusted application-owned artifacts.
+        data = joblib.load(root / manifest['artifact'])
+        question = normalize(question, data['synonyms'])
+        terms = set(tokenize(question))
+        q = data['vectorizer'].transform([question])
+        if not terms or q.nnz == 0:
+            return {'status': 'no_match', 'reason': 'No indexed query terms', 'matches': []}
+        scores = (data['matrix'] @ q.T).toarray().ravel()
+        candidates = []
+        for i in np.argsort(-scores, kind='stable'):
+            rec = data['records'][int(i)]
+            present = set(tokenize(normalize(rec['section'] + '\n' + rec['text'], data['synonyms'])))
+            shared = terms & present
+            coverage = len(shared) / len(terms)  # Includes unknown query terms.
+            if scores[i] < min_score or coverage < min_coverage:
+                continue
+            candidates.append({'id': str(i), 'score': float(scores[i]),
+                               'coverage': coverage, 'matched_terms': sorted(shared)})
+            if len(candidates) == top_k:
+                break
+        if not candidates:
+            return {'status': 'no_match', 'reason': 'Below lexical relevance thresholds', 'matches': []}
+        collection = client(root).get_collection(manifest['collection'], embedding_function=None)
+        stored = collection.get(ids=[c['id'] for c in candidates],
+                                include=['documents', 'metadatas'])
+        lookup = {id_: (doc, meta) for id_, doc, meta in
+                  zip(stored['ids'], stored['documents'], stored['metadatas'])}
+        for candidate in candidates:
+            doc, meta = lookup[candidate.pop('id')]
+            candidate.update(text=doc, **meta)
+        return {'status': 'matched', 'matches': candidates}
 
-    if not found:
-        print("No matching passage found.")
 
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--index-dir', default='./policy_index_fixed')
+    subs = p.add_subparsers(dest='command', required=True)
+    u = subs.add_parser('upload')
+    u.add_argument('file')
+    u.add_argument('--synonyms', help='Optional reviewed JSON phrase aliases')
+    u.add_argument('--chunk-size', type=int, default=700)
+    u.add_argument('--overlap', type=int, default=100)
+    s = subs.add_parser('search')
+    s.add_argument('question')
+    s.add_argument('--top-k', type=int, default=3)
+    s.add_argument('--min-score', type=float, default=0.15)
+    s.add_argument('--min-coverage', type=float, default=0.5)
+    args = p.parse_args()
+    try:
+        if args.command == 'upload':
+            synonyms = json.loads(Path(args.synonyms).read_text()) if args.synonyms else {}
+            result = upload(args.file, args.index_dir, synonyms, args.chunk_size, args.overlap)
+        else:
+            result = search(args.question, args.index_dir, args.top_k, args.min_score, args.min_coverage)
+        print(json.dumps(result, indent=2))
+    except (ValueError, OSError) as exc:
+        p.exit(2, f'Error: {exc}\n')
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--index-dir", default="./policy_index")
-
-    commands = parser.add_subparsers(dest="command", required=True)
-
-    upload_parser = commands.add_parser("upload")
-    upload_parser.add_argument("file")
-
-    search_parser = commands.add_parser("search")
-    search_parser.add_argument("question")
-
-    args = parser.parse_args()
-    index_dir = Path(args.index_dir).resolve()
-
-    if args.command == "upload":
-        upload_or_update(args.file, index_dir)
-    else:
-        search(args.question, index_dir)
+if __name__ == '__main__':
+    main()
